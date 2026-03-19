@@ -44,6 +44,11 @@ def publish_reset_category(category: int, publisher):  # Scene Reset signal
     logger_mp.info(f"published reset category: {category}")
 
 
+def publish_run_command(command, publisher):
+    msg = String_(data=str(command))
+    publisher.Write(msg)
+
+
 # state transition
 START = False  # Enable to start robot following VR user motion
 STOP = False  # Enable to begin system exit procedure
@@ -196,25 +201,45 @@ if __name__ == "__main__":
             webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
         )
 
+        motion_switcher = None
+        loco_wrapper = None
+        run_command_publisher = None
+        sim_stand_height = 0.8
+        arm_motion_mode = args.motion and (not args.sim)
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
+            if args.sim:
+                logger_mp.info("Simulation mode: skip MotionSwitcher; keep arm lowcmd on rt/lowcmd.")
+            else:
+                # Ensure robot is switched out of debug mode before sending motion/loco RPC commands.
+                motion_switcher = MotionSwitcher()
+                status, result = motion_switcher.Exit_Debug_Mode()
+                logger_mp.info(f"Exit debug mode for motion: {'Success' if status == 0 else 'Failed'}")
             if args.input_mode == "controller":
-                loco_wrapper = LocoClientWrapper()
+                if args.sim:
+                    run_command_publisher = ChannelPublisher("rt/run_command/cmd", String_)
+                    run_command_publisher.Init()
+                    logger_mp.info("Simulation speed control publisher initialized: rt/run_command/cmd")
+                else:
+                    loco_wrapper = LocoClientWrapper()
         else:
-            motion_switcher = MotionSwitcher()
-            status, result = motion_switcher.Enter_Debug_Mode()
-            logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
+            if args.sim:
+                logger_mp.info("Simulation mode: skip MotionSwitcher.")
+            else:
+                motion_switcher = MotionSwitcher()
+                status, result = motion_switcher.Enter_Debug_Mode()
+                logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
 
         # arm
         if args.arm == "G1_29":
             arm_ik = G1_29_ArmIK()
-            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            arm_ctrl = G1_29_ArmController(motion_mode=arm_motion_mode, simulation_mode=args.sim)
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
-            arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            arm_ctrl = G1_23_ArmController(motion_mode=arm_motion_mode, simulation_mode=args.sim)
         elif args.arm == "H1_2":
             arm_ik = H1_2_ArmIK()
-            arm_ctrl = H1_2_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            arm_ctrl = H1_2_ArmController(motion_mode=arm_motion_mode, simulation_mode=args.sim)
         elif args.arm == "H1":
             arm_ik = H1_ArmIK()
             arm_ctrl = H1_ArmController(simulation_mode=args.sim)
@@ -391,6 +416,9 @@ if __name__ == "__main__":
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+            vx = -tele_data.left_ctrl_thumbstickValue[1] * 0.8
+            vy = -tele_data.left_ctrl_thumbstickValue[0] * 0.8
+            vyaw = -tele_data.right_ctrl_thumbstickValue[0] * 0.8
             if (
                 args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco"
             ) and args.input_mode == "hand":
@@ -420,13 +448,16 @@ if __name__ == "__main__":
                     STOP = True
                 # command robot to enter damping mode. soft emergency stop function
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
-                    loco_wrapper.Damp()
+                    if args.sim:
+                        publish_run_command([0.0, 0.0, 0.0, sim_stand_height], run_command_publisher)
+                    else:
+                        loco_wrapper.Enter_Damp_Mode()
                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
-                loco_wrapper.Move(
-                    -tele_data.left_ctrl_thumbstickValue[1] * 0.3,
-                    -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
-                    -tele_data.right_ctrl_thumbstickValue[0] * 0.3,
-                )
+                if args.sim:
+                    publish_run_command([vx, vy, vyaw, sim_stand_height], run_command_publisher)
+                    print(f"Published run command: vx: {vx}, vy: {vy}, vyaw: {vyaw}, stand_height: {sim_stand_height}")
+                else:
+                    loco_wrapper.Move(vx, vy, vyaw)
 
             # get current robot state data.
             current_lr_arm_q = arm_ctrl.get_current_dual_arm_q()
@@ -469,9 +500,9 @@ if __name__ == "__main__":
                         right_hand_action = [dual_gripper_action_array[1]]
                         current_body_state = arm_ctrl.get_current_motor_q().tolist()
                         current_body_action = [
-                            -tele_data.left_ctrl_thumbstickValue[1] * 0.3,
-                            -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
-                            -tele_data.right_ctrl_thumbstickValue[0] * 0.3,
+                            vx,
+                            vy,
+                            vyaw,
                         ]
                 elif (
                     args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco"
