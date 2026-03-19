@@ -521,7 +521,7 @@ if __name__ == "__main__":
                                 logger_mp.warning("Right wrist image is None!")
                     else:
                         if head_img is not None:
-                            colors[f"color_{0}"] = head_img
+                            colors[f"color_{0}"] = head_img.bgr
                         else:
                             logger_mp.warning("Head image is None!")
                         if camera_config["left_wrist_camera"]["enable_zmq"]:
