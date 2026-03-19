@@ -1198,13 +1198,179 @@ class H1_ArmIK:
 
             # return sol_q, sol_tauff
             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
-        
-if __name__ == "__main__":
-    arm_ik = G1_29_ArmIK(Unit_Test = True, Visualization = True)
-    # arm_ik = H1_2_ArmIK(Unit_Test = True, Visualization = True)
-    # arm_ik = G1_23_ArmIK(Unit_Test = True, Visualization = True)
-    # arm_ik = H1_ArmIK(Unit_Test = True, Visualization = True)
 
+
+def _select_arm_ik(arm_type, unit_test, visualization):
+    arm_type_normalized = arm_type.strip().lower()
+    if arm_type_normalized == "g1_29":
+        return G1_29_ArmIK(Unit_Test=unit_test, Visualization=visualization)
+    if arm_type_normalized == "g1_23":
+        return G1_23_ArmIK(Unit_Test=unit_test, Visualization=visualization)
+    if arm_type_normalized == "h1_2":
+        return H1_2_ArmIK(Unit_Test=unit_test, Visualization=visualization)
+    if arm_type_normalized == "h1":
+        return H1_ArmIK(Unit_Test=unit_test, Visualization=visualization)
+    raise ValueError(f"Unsupported arm_type: {arm_type}")
+
+
+def _make_target_pair(step, base_left, base_right, rotation_speed, noise_translation, noise_rotation):
+    left_target = pin.SE3(base_left.rotation.copy(), base_left.translation.copy())
+    right_target = pin.SE3(base_right.rotation.copy(), base_right.translation.copy())
+
+    rotation_noise_left = pin.Quaternion(
+        np.cos(np.random.normal(0, noise_rotation) / 2),
+        0,
+        np.random.normal(0, noise_rotation / 2),
+        0,
+    ).normalized()
+    rotation_noise_right = pin.Quaternion(
+        np.cos(np.random.normal(0, noise_rotation) / 2),
+        0,
+        0,
+        np.random.normal(0, noise_rotation / 2),
+    ).normalized()
+
+    folded_step = step % 240
+    if folded_step <= 120:
+        angle = rotation_speed * folded_step
+        left_target.rotation = (rotation_noise_left * pin.Quaternion(np.cos(angle / 2), 0, np.sin(angle / 2), 0)).toRotationMatrix()
+        right_target.rotation = (rotation_noise_right * pin.Quaternion(np.cos(angle / 2), 0, 0, np.sin(angle / 2))).toRotationMatrix()
+        left_target.translation += (np.array([0.001, 0.001, 0.001]) + np.random.normal(0, noise_translation, 3))
+        right_target.translation += (np.array([0.001, -0.001, 0.001]) + np.random.normal(0, noise_translation, 3))
+    else:
+        angle = rotation_speed * (240 - folded_step)
+        left_target.rotation = (rotation_noise_left * pin.Quaternion(np.cos(angle / 2), 0, np.sin(angle / 2), 0)).toRotationMatrix()
+        right_target.rotation = (rotation_noise_right * pin.Quaternion(np.cos(angle / 2), 0, 0, np.sin(angle / 2))).toRotationMatrix()
+        left_target.translation -= (np.array([0.001, 0.001, 0.001]) + np.random.normal(0, noise_translation, 3))
+        right_target.translation -= (np.array([0.001, -0.001, 0.001]) + np.random.normal(0, noise_translation, 3))
+
+    return left_target.homogeneous, right_target.homogeneous
+
+
+def run_ik_benchmark(
+    arm_type="g1_29",
+    unit_test=True,
+    visualization=False,
+    warmup_steps=30,
+    benchmark_steps=300,
+    profile_output="ik_benchmark_profile.html",
+):
+    def _benchmark_out(message):
+        print(message)
+        logger_mp.info(message)
+
+    rotation_speed = 0.005
+    noise_amplitude_translation = 0.001
+    noise_amplitude_rotation = 0.01
+
+    base_left = pin.SE3(pin.Quaternion(1, 0, 0, 0), np.array([0.25, +0.25, 0.1]))
+    base_right = pin.SE3(pin.Quaternion(1, 0, 0, 0), np.array([0.25, -0.25, 0.1]))
+
+    init_start = time.perf_counter()
+    arm_ik = _select_arm_ik(arm_type, unit_test, visualization)
+    init_elapsed = time.perf_counter() - init_start
+
+    _benchmark_out("=" * 80)
+    _benchmark_out(f"[Benchmark] Arm type: {arm_type}")
+    _benchmark_out(f"[Benchmark] Init elapsed: {init_elapsed * 1000:.3f} ms")
+    _benchmark_out(f"[Benchmark] Warmup steps: {warmup_steps}, Benchmark steps: {benchmark_steps}")
+
+    for i in range(max(0, warmup_steps)):
+        left_target, right_target = _make_target_pair(
+            i,
+            base_left,
+            base_right,
+            rotation_speed,
+            noise_amplitude_translation,
+            noise_amplitude_rotation,
+        )
+        arm_ik.solve_ik(left_target, right_target)
+
+    target_times = []
+    solve_times = []
+    iter_times = []
+
+    profiler = None
+    try:
+        profiler_module = __import__("pyinstrument", fromlist=["Profiler"])
+        profiler = profiler_module.Profiler(interval=0.001)
+        profiler.start()
+    except Exception:
+        logger_mp.warning("[Benchmark] pyinstrument not found. Install it to get call-graph profiling.")
+
+    bench_start = time.perf_counter()
+    for i in range(max(1, benchmark_steps)):
+        iter_start = time.perf_counter()
+
+        target_start = time.perf_counter()
+        left_target, right_target = _make_target_pair(
+            i,
+            base_left,
+            base_right,
+            rotation_speed,
+            noise_amplitude_translation,
+            noise_amplitude_rotation,
+        )
+        target_times.append(time.perf_counter() - target_start)
+
+        solve_start = time.perf_counter()
+        arm_ik.solve_ik(left_target, right_target)
+        solve_times.append(time.perf_counter() - solve_start)
+
+        iter_times.append(time.perf_counter() - iter_start)
+
+    bench_elapsed = time.perf_counter() - bench_start
+
+    if profiler is not None:
+        profiler.stop()
+        profiler.write_html(profile_output)
+        _benchmark_out(f"[Benchmark] pyinstrument html: {profile_output}")
+        profile_text = profiler.output_text(unicode=True, color=False, show_all=False)
+        _benchmark_out("[Benchmark] pyinstrument text report:")
+        print(profile_text)
+        logger_mp.info("\n" + profile_text)
+
+    target_times_np = np.array(target_times)
+    solve_times_np = np.array(solve_times)
+    iter_times_np = np.array(iter_times)
+
+    mean_target = float(np.mean(target_times_np))
+    mean_solve = float(np.mean(solve_times_np))
+    mean_iter = float(np.mean(iter_times_np))
+
+    p50_solve = float(np.percentile(solve_times_np, 50))
+    p90_solve = float(np.percentile(solve_times_np, 90))
+    p99_solve = float(np.percentile(solve_times_np, 99))
+
+    measured_loop_hz = len(iter_times) / bench_elapsed if bench_elapsed > 0 else 0.0
+    max_hz_avg = 1.0 / mean_solve if mean_solve > 0 else 0.0
+    max_hz_p90 = 1.0 / p90_solve if p90_solve > 0 else 0.0
+
+    _benchmark_out("-" * 80)
+    _benchmark_out(f"[Benchmark] Target generation avg: {mean_target * 1000:.3f} ms")
+    _benchmark_out(f"[Benchmark] IK solve avg: {mean_solve * 1000:.3f} ms")
+    _benchmark_out(f"[Benchmark] IK solve p50/p90/p99: {p50_solve * 1000:.3f}/{p90_solve * 1000:.3f}/{p99_solve * 1000:.3f} ms")
+    _benchmark_out(f"[Benchmark] Iteration avg: {mean_iter * 1000:.3f} ms")
+    _benchmark_out(f"[Benchmark] Measured loop frequency: {measured_loop_hz:.2f} Hz")
+    _benchmark_out(f"[Benchmark] Estimated max frequency (1/mean solve): {max_hz_avg:.2f} Hz")
+    _benchmark_out(f"[Benchmark] Stable max frequency (1/p90 solve): {max_hz_p90:.2f} Hz")
+    _benchmark_out("=" * 80)
+
+    return {
+        "init_elapsed_s": init_elapsed,
+        "mean_target_s": mean_target,
+        "mean_solve_s": mean_solve,
+        "p50_solve_s": p50_solve,
+        "p90_solve_s": p90_solve,
+        "p99_solve_s": p99_solve,
+        "mean_iter_s": mean_iter,
+        "measured_loop_hz": measured_loop_hz,
+        "max_hz_avg": max_hz_avg,
+        "max_hz_p90": max_hz_p90,
+    }
+
+
+def _run_visual_demo(arm_ik):
     # initial positon
     L_tf_target = pin.SE3(
         pin.Quaternion(1, 0, 0, 0),
@@ -1250,3 +1416,46 @@ if __name__ == "__main__":
             if step > 240:
                 step = 0
             time.sleep(0.1)
+
+if __name__ == "__main__":
+    run_benchmark = False
+    for arg in sys.argv[1:]:
+        if arg.lower() in ("benchmark", "--benchmark", "-b"):
+            run_benchmark = True
+
+    if run_benchmark:
+        arm_type = "g1_29"
+        warmup_steps = 30
+        benchmark_steps = 300
+        profile_output = "ik_benchmark_profile.html"
+        unit_test = True
+        visualization = False
+
+        for arg in sys.argv[1:]:
+            if arg.startswith("--arm="):
+                arm_type = arg.split("=", 1)[1]
+            elif arg.startswith("--warmup="):
+                warmup_steps = int(arg.split("=", 1)[1])
+            elif arg.startswith("--steps="):
+                benchmark_steps = int(arg.split("=", 1)[1])
+            elif arg.startswith("--profile="):
+                profile_output = arg.split("=", 1)[1]
+            elif arg.startswith("--unit_test="):
+                unit_test = bool(int(arg.split("=", 1)[1]))
+            elif arg.startswith("--visualization="):
+                visualization = bool(int(arg.split("=", 1)[1]))
+
+        run_ik_benchmark(
+            arm_type=arm_type,
+            unit_test=unit_test,
+            visualization=visualization,
+            warmup_steps=warmup_steps,
+            benchmark_steps=benchmark_steps,
+            profile_output=profile_output,
+        )
+    else:
+        arm_ik = G1_29_ArmIK(Unit_Test=True, Visualization=True)
+        # arm_ik = H1_2_ArmIK(Unit_Test=True, Visualization=True)
+        # arm_ik = G1_23_ArmIK(Unit_Test=True, Visualization=True)
+        # arm_ik = H1_ArmIK(Unit_Test=True, Visualization=True)
+        _run_visual_demo(arm_ik)
