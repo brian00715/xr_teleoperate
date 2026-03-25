@@ -37,7 +37,7 @@ class EpisodeWriter():
             logger_mp.info("==> RerunLogger initializing...\n")
             self.rerun_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit = "300MB")
             logger_mp.info("==> RerunLogger initializing ok.\n")
-        
+
         self.item_id = -1
         self.episode_id = -1
         if os.path.exists(self.task_dir):
@@ -59,13 +59,13 @@ class EpisodeWriter():
         self.worker_thread.start()
 
         logger_mp.info("==> EpisodeWriter initialized successfully.\n")
-    
+
     def is_ready(self):
         return self.is_available
 
     def data_info(self, version='1.0.0', date=None, author=None):
         self.info = {
-                "version": "1.0.0" if version is None else version, 
+                "version": "1.0.0" if version is None else version,
                 "date": datetime.date.today().strftime('%Y-%m-%d') if date is None else date,
                 "author": "unitree" if author is None else author,
                 "image": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
@@ -82,11 +82,11 @@ class EpisodeWriter():
                 "tactile_names": {
                     "left_ee": [],
                     "right_ee": [],
-                }, 
+                },
                 "sim_state": ""
             }
 
- 
+
     def create_episode(self):
         """
         Create a new episode.
@@ -102,7 +102,7 @@ class EpisodeWriter():
         # Reset episode-related data and create necessary directories
         self.item_id = -1
         self.episode_id = self.episode_id + 1
-        
+
         self.episode_dir = os.path.join(self.task_dir, f"episode_{str(self.episode_id).zfill(4)}")
         self.color_dir = os.path.join(self.episode_dir, 'colors')
         self.depth_dir = os.path.join(self.episode_dir, 'depths')
@@ -125,7 +125,7 @@ class EpisodeWriter():
         self.is_available = False  # After the episode is created, the class is marked as unavailable until the episode is successfully saved
         logger_mp.info(f"==> New episode created: {self.episode_dir}")
         return True  # Return True if the episode is successfully created
-        
+
     def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
         # Increment the item ID
         self.item_id += 1
@@ -155,10 +155,39 @@ class EpisodeWriter():
                 self.item_data_queue.task_done()
             except Empty:
                 pass
-        
+
             # Check if save_episode was triggered
             if self.need_save and self.item_data_queue.empty():
                 self._save_episode()
+
+    def _normalize_image(self, image):
+        if image is None:
+            return None
+
+        if isinstance(image, np.ndarray):
+            return image
+
+        if hasattr(image, 'bgr'):
+            bgr = image.bgr
+            if isinstance(bgr, np.ndarray):
+                return bgr
+            return None
+
+        if isinstance(image, (bytes, bytearray, memoryview)):
+            image_np = np.frombuffer(image, dtype=np.uint8)
+            if image_np.size == 0:
+                return None
+            return cv2.imdecode(image_np, cv2.IMREAD_UNCHANGED)
+
+        try:
+            image_np = np.asarray(image)
+        except Exception:
+            return None
+
+        if image_np.size == 0:
+            return None
+
+        return image_np
 
     def _process_item_data(self, item_data):
         idx = item_data['idx']
@@ -170,7 +199,11 @@ class EpisodeWriter():
         if colors:
             for idx_color, (color_key, color) in enumerate(colors.items()):
                 color_name = f'{str(idx).zfill(6)}_{color_key}.jpg'
-                if not cv2.imwrite(os.path.join(self.color_dir, color_name), color):
+                color_image = self._normalize_image(color)
+                if color_image is None:
+                    logger_mp.info(f"Skip invalid color image for key={color_key}, type={type(color)}")
+                    continue
+                if not cv2.imwrite(os.path.join(self.color_dir, color_name), color_image):
                     logger_mp.info(f"Failed to save color image.")
                 item_data['colors'][color_key] = os.path.join('colors', color_name)
 
@@ -178,7 +211,11 @@ class EpisodeWriter():
         if depths:
             for idx_depth, (depth_key, depth) in enumerate(depths.items()):
                 depth_name = f'{str(idx).zfill(6)}_{depth_key}.jpg'
-                if not cv2.imwrite(os.path.join(self.depth_dir, depth_name), depth):
+                depth_image = self._normalize_image(depth)
+                if depth_image is None:
+                    logger_mp.info(f"Skip invalid depth image for key={depth_key}, type={type(depth)}")
+                    continue
+                if not cv2.imwrite(os.path.join(self.depth_dir, depth_name), depth_image):
                     logger_mp.info(f"Failed to save depth image.")
                 item_data['depths'][depth_key] = os.path.join('depths', depth_name)
 
