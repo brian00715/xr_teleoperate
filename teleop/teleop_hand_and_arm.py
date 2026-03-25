@@ -4,6 +4,7 @@ import time
 from multiprocessing import Array, Lock, Value
 
 import logging_mp
+import numpy as np
 
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
@@ -36,6 +37,58 @@ from teleop.robot_control.robot_arm_ik import G1_23_ArmIK, G1_29_ArmIK, H1_2_Arm
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import LocoClientWrapper, MotionSwitcher
+
+
+def _skew(v: np.ndarray) -> np.ndarray:
+    return np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+
+
+def _rotation_to_axis_angle(rot: np.ndarray) -> np.ndarray:
+    trace_val = float(np.trace(rot))
+    cos_theta = np.clip((trace_val - 1.0) * 0.5, -1.0, 1.0)
+    theta = float(np.arccos(cos_theta))
+    if theta < 1e-8:
+        return np.zeros(3)
+
+    if np.pi - theta < 1e-5:
+        # Near 180 deg, use diagonal terms for numerical stability.
+        axis = np.sqrt(np.maximum((np.diag(rot) + 1.0) * 0.5, 0.0))
+        if axis[0] < 1e-6 and axis[1] < 1e-6 and axis[2] < 1e-6:
+            axis = np.array([1.0, 0.0, 0.0])
+        else:
+            axis = axis / (np.linalg.norm(axis) + 1e-12)
+        return axis * theta
+
+    axis = np.array(
+        [
+            rot[2, 1] - rot[1, 2],
+            rot[0, 2] - rot[2, 0],
+            rot[1, 0] - rot[0, 1],
+        ]
+    ) / (2.0 * np.sin(theta))
+    return axis * theta
+
+
+def _axis_angle_to_rotation(axis_angle: np.ndarray) -> np.ndarray:
+    theta = float(np.linalg.norm(axis_angle))
+    if theta < 1e-8:
+        return np.eye(3) + _skew(axis_angle)
+    axis = axis_angle / theta
+    k = _skew(axis)
+    return np.eye(3) + np.sin(theta) * k + (1.0 - np.cos(theta)) * (k @ k)
+
+
+def scale_wrist_pose(pose: np.ndarray, ref_pose: np.ndarray, pos_scale: float, rot_scale: float) -> np.ndarray:
+    delta = np.linalg.inv(ref_pose) @ pose
+    delta_t = delta[:3, 3] * pos_scale
+    delta_rot = delta[:3, :3]
+    delta_axis_angle = _rotation_to_axis_angle(delta_rot)
+    scaled_rot = _axis_angle_to_rotation(delta_axis_angle * rot_scale)
+
+    scaled_delta = np.eye(4)
+    scaled_delta[:3, :3] = scaled_rot
+    scaled_delta[:3, 3] = delta_t
+    return ref_pose @ scaled_delta
 
 
 def publish_reset_category(category: int, publisher):  # Scene Reset signal
@@ -131,6 +184,18 @@ if __name__ == "__main__":
         default=None,
         help="Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.",
     )
+    parser.add_argument(
+        "--ee-translation-scale",
+        type=float,
+        default=1.5,
+        help="Scale factor for EE translation from XR wrist pose to robot EE target pose.",
+    )
+    parser.add_argument(
+        "--ee-rotation-scale",
+        type=float,
+        default=1.2,
+        help="Scale factor for EE rotation angle (axis-angle) from XR wrist pose to robot EE target pose.",
+    )
     # mode flags
     parser.add_argument("--motion", action="store_true", help="Enable motion control mode")
     parser.add_argument("--headless", action="store_true", help="Enable headless mode (no display)")
@@ -204,7 +269,7 @@ if __name__ == "__main__":
         motion_switcher = None
         loco_wrapper = None
         run_command_publisher = None
-        sim_stand_height = 0.8
+        sim_stand_height = 0.75
         arm_motion_mode = args.motion and (not args.sim)
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
@@ -375,6 +440,9 @@ if __name__ == "__main__":
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+        logger_mp.info(
+            f"EE pose scale: translation={args.ee_translation_scale}, rotation(axis-angle)={args.ee_rotation_scale}"
+        )
         READY = True  # now ready to (1) enter START state
         while not START and not STOP:  # wait for start or stop signal.
             time.sleep(0.033)
@@ -384,6 +452,8 @@ if __name__ == "__main__":
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
+        left_wrist_ref_pose = None
+        right_wrist_ref_pose = None
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
@@ -416,9 +486,9 @@ if __name__ == "__main__":
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
-            vx = -tele_data.left_ctrl_thumbstickValue[1] * 0.8
-            vy = -tele_data.left_ctrl_thumbstickValue[0] * 0.8
-            vyaw = -tele_data.right_ctrl_thumbstickValue[0] * 0.8
+            vx = -tele_data.left_ctrl_thumbstickValue[1] * 1.0
+            vy = -tele_data.left_ctrl_thumbstickValue[0] * 1.0
+            vyaw = -tele_data.right_ctrl_thumbstickValue[0] * 2.0
             if (
                 args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco"
             ) and args.input_mode == "hand":
@@ -455,7 +525,6 @@ if __name__ == "__main__":
                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
                 if args.sim:
                     publish_run_command([vx, vy, vyaw, sim_stand_height], run_command_publisher)
-                    print(f"Published run command: vx: {vx}, vy: {vy}, vyaw: {vyaw}, stand_height: {sim_stand_height}")
                 else:
                     loco_wrapper.Move(vx, vy, vyaw)
 
@@ -464,9 +533,22 @@ if __name__ == "__main__":
             current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
+            left_wrist_pose = tele_data.left_wrist_pose
+            right_wrist_pose = tele_data.right_wrist_pose
+            if args.ee_translation_scale != 1.0 or args.ee_rotation_scale != 1.0:
+                if left_wrist_ref_pose is None or right_wrist_ref_pose is None:
+                    left_wrist_ref_pose = left_wrist_pose.copy()
+                    right_wrist_ref_pose = right_wrist_pose.copy()
+                left_wrist_pose = scale_wrist_pose(
+                    left_wrist_pose, left_wrist_ref_pose, args.ee_translation_scale, args.ee_rotation_scale
+                )
+                right_wrist_pose = scale_wrist_pose(
+                    right_wrist_pose, right_wrist_ref_pose, args.ee_translation_scale, args.ee_rotation_scale
+                )
+
             time_ik_start = time.time()
             sol_q, sol_tauff = arm_ik.solve_ik(
-                tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq
+                left_wrist_pose, right_wrist_pose, current_lr_arm_q, current_lr_arm_dq
             )
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
