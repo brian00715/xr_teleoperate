@@ -196,6 +196,13 @@ if __name__ == "__main__":
         default=1.2,
         help="Scale factor for EE rotation angle (axis-angle) from XR wrist pose to robot EE target pose.",
     )
+    parser.add_argument(
+        "--control-mode",
+        type=str,
+        choices=["loco", "manip", "loco-manip"],
+        default="loco-manip",
+        help="Control arbitration mode: loco only, manip only, or loco + manip.",
+    )
     # mode flags
     parser.add_argument("--motion", action="store_true", help="Enable motion control mode")
     parser.add_argument("--headless", action="store_true", help="Enable headless mode (no display)")
@@ -270,7 +277,18 @@ if __name__ == "__main__":
         loco_wrapper = None
         run_command_publisher = None
         sim_stand_height = 0.75
+        control_mode = args.control_mode
         arm_motion_mode = args.motion and (not args.sim)
+        controller_input = args.input_mode == "controller"
+        enable_loco_control = args.motion and args.input_mode == "controller" and control_mode in ("loco", "loco-manip")
+        enable_arm_control = control_mode in ("manip", "loco-manip")
+        lock_lower_body_for_arm = control_mode != "loco-manip"
+        arm_ctrl = None
+        arm_ik = None
+        logger_mp.info(
+            f"Control mode={control_mode}, enable_loco={enable_loco_control}, "
+            f"enable_arm={enable_arm_control}, lock_lower_body_for_arm={lock_lower_body_for_arm}"
+        )
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
             if args.sim:
@@ -280,13 +298,17 @@ if __name__ == "__main__":
                 motion_switcher = MotionSwitcher()
                 status, result = motion_switcher.Exit_Debug_Mode()
                 logger_mp.info(f"Exit debug mode for motion: {'Success' if status == 0 else 'Failed'}")
-            if args.input_mode == "controller":
+            if controller_input:
                 if args.sim:
                     run_command_publisher = ChannelPublisher("rt/run_command/cmd", String_)
                     run_command_publisher.Init()
-                    logger_mp.info("Simulation speed control publisher initialized: rt/run_command/cmd")
+                    logger_mp.info("Simulation run_command publisher initialized: rt/run_command/cmd")
                 else:
                     loco_wrapper = LocoClientWrapper()
+                    logger_mp.info("LocoClientWrapper initialized for controller safety actions (damp/stop).")
+                    if enable_loco_control:
+                        move_mode_code = loco_wrapper.Exit_Damp_Mode()
+                        logger_mp.info(f"Enter move mode at startup code={move_mode_code}")
         else:
             if args.sim:
                 logger_mp.info("Simulation mode: skip MotionSwitcher.")
@@ -296,18 +318,33 @@ if __name__ == "__main__":
                 logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
 
         # arm
-        if args.arm == "G1_29":
-            arm_ik = G1_29_ArmIK()
-            arm_ctrl = G1_29_ArmController(motion_mode=arm_motion_mode, simulation_mode=args.sim)
-        elif args.arm == "G1_23":
-            arm_ik = G1_23_ArmIK()
-            arm_ctrl = G1_23_ArmController(motion_mode=arm_motion_mode, simulation_mode=args.sim)
-        elif args.arm == "H1_2":
-            arm_ik = H1_2_ArmIK()
-            arm_ctrl = H1_2_ArmController(motion_mode=arm_motion_mode, simulation_mode=args.sim)
-        elif args.arm == "H1":
-            arm_ik = H1_ArmIK()
-            arm_ctrl = H1_ArmController(simulation_mode=args.sim)
+        if enable_arm_control:
+            if args.arm == "G1_29":
+                arm_ik = G1_29_ArmIK()
+                arm_ctrl = G1_29_ArmController(
+                    motion_mode=arm_motion_mode,
+                    simulation_mode=args.sim,
+                    lock_lower_body_joints=lock_lower_body_for_arm,
+                )
+            elif args.arm == "G1_23":
+                arm_ik = G1_23_ArmIK()
+                arm_ctrl = G1_23_ArmController(
+                    motion_mode=arm_motion_mode,
+                    simulation_mode=args.sim,
+                    lock_lower_body_joints=lock_lower_body_for_arm,
+                )
+            elif args.arm == "H1_2":
+                arm_ik = H1_2_ArmIK()
+                arm_ctrl = H1_2_ArmController(
+                    motion_mode=arm_motion_mode,
+                    simulation_mode=args.sim,
+                    lock_lower_body_joints=lock_lower_body_for_arm,
+                )
+            elif args.arm == "H1":
+                arm_ik = H1_ArmIK()
+                arm_ctrl = H1_ArmController(simulation_mode=args.sim)
+        else:
+            logger_mp.info("Arm controller and IK are disabled by control mode.")
 
         # end-effector
         if args.ee == "dex3":
@@ -451,9 +488,13 @@ if __name__ == "__main__":
                 tv_wrapper.render_to_xr(head_img)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
-        arm_ctrl.speed_gradual_max()
+        if enable_arm_control and arm_ctrl is not None:
+            arm_ctrl.speed_gradual_max()
         left_wrist_ref_pose = None
         right_wrist_ref_pose = None
+        damp_pressed_last = False
+        in_damp_mode = False
+        next_loco_log_time = 0.0
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
@@ -510,49 +551,72 @@ if __name__ == "__main__":
                 pass
             # print(f"tele_data: left_wrist_pose: {tele_data.left_wrist_pose}, right_wrist_pose: {tele_data.right_wrist_pose}")
 
+            if controller_input and tele_data.right_ctrl_aButton:
+                START = False
+                STOP = True
+
+            damp_pressed_now = controller_input and tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick
+            if damp_pressed_now and (not damp_pressed_last):
+                if args.sim and run_command_publisher is not None:
+                    publish_run_command([0.0, 0.0, 0.0, sim_stand_height], run_command_publisher)
+                    logger_mp.info("Enter damp mode command published in simulation.")
+                    in_damp_mode = True
+                elif loco_wrapper is not None:
+                    code = loco_wrapper.Enter_Damp_Mode()
+                    logger_mp.info(f"Enter damp mode code={code}")
+                    in_damp_mode = (code == 0)
+            damp_pressed_last = damp_pressed_now
+
             # high level control
-            if args.input_mode == "controller" and args.motion:
-                # quit teleoperate
-                if tele_data.right_ctrl_aButton:
-                    START = False
-                    STOP = True
-                # command robot to enter damping mode. soft emergency stop function
-                if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
-                    if args.sim:
-                        publish_run_command([0.0, 0.0, 0.0, sim_stand_height], run_command_publisher)
-                    else:
-                        loco_wrapper.Enter_Damp_Mode()
+            if enable_loco_control:
                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
                 if args.sim:
                     publish_run_command([vx, vy, vyaw, sim_stand_height], run_command_publisher)
                 else:
-                    loco_wrapper.Move(vx, vy, vyaw)
+                    if in_damp_mode and (abs(vx) > 1e-3 or abs(vy) > 1e-3 or abs(vyaw) > 1e-3):
+                        recover_code = loco_wrapper.Exit_Damp_Mode()
+                        logger_mp.info(f"Exit damp mode code={recover_code}")
+                        in_damp_mode = False if recover_code == 0 else in_damp_mode
+                    code = loco_wrapper.Move(vx, vy, vyaw)
+                    now = time.time()
+                    if now >= next_loco_log_time:
+                        fsm_code, fsm_id = loco_wrapper.Get_Fsm_Id()
+                        logger_mp.info(
+                            f"Motion code={code}, fsm_code={fsm_code}, fsm_id={fsm_id}, "
+                            f"vx={vx:.3f}, vy={vy:.3f}, vyaw={vyaw:.3f}, in_damp={in_damp_mode}"
+                        )
+                        next_loco_log_time = now + 1.0
 
-            # get current robot state data.
-            current_lr_arm_q = arm_ctrl.get_current_dual_arm_q()
-            current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
+            # get current robot state data and solve ik (disabled during locomotion-only test)
+            if enable_arm_control and arm_ctrl is not None and arm_ik is not None:
+                current_lr_arm_q = arm_ctrl.get_current_dual_arm_q()
+                current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
 
-            # solve ik using motor data and wrist pose, then use ik results to control arms.
-            left_wrist_pose = tele_data.left_wrist_pose
-            right_wrist_pose = tele_data.right_wrist_pose
-            if args.ee_translation_scale != 1.0 or args.ee_rotation_scale != 1.0:
-                if left_wrist_ref_pose is None or right_wrist_ref_pose is None:
-                    left_wrist_ref_pose = left_wrist_pose.copy()
-                    right_wrist_ref_pose = right_wrist_pose.copy()
-                left_wrist_pose = scale_wrist_pose(
-                    left_wrist_pose, left_wrist_ref_pose, args.ee_translation_scale, args.ee_rotation_scale
+                left_wrist_pose = tele_data.left_wrist_pose
+                right_wrist_pose = tele_data.right_wrist_pose
+                if args.ee_translation_scale != 1.0 or args.ee_rotation_scale != 1.0:
+                    if left_wrist_ref_pose is None or right_wrist_ref_pose is None:
+                        left_wrist_ref_pose = left_wrist_pose.copy()
+                        right_wrist_ref_pose = right_wrist_pose.copy()
+                    left_wrist_pose = scale_wrist_pose(
+                        left_wrist_pose, left_wrist_ref_pose, args.ee_translation_scale, args.ee_rotation_scale
+                    )
+                    right_wrist_pose = scale_wrist_pose(
+                        right_wrist_pose, right_wrist_ref_pose, args.ee_translation_scale, args.ee_rotation_scale
+                    )
+
+                time_ik_start = time.time()
+                sol_q, sol_tauff = arm_ik.solve_ik(
+                    left_wrist_pose, right_wrist_pose, current_lr_arm_q, current_lr_arm_dq
                 )
-                right_wrist_pose = scale_wrist_pose(
-                    right_wrist_pose, right_wrist_ref_pose, args.ee_translation_scale, args.ee_rotation_scale
-                )
-
-            time_ik_start = time.time()
-            sol_q, sol_tauff = arm_ik.solve_ik(
-                left_wrist_pose, right_wrist_pose, current_lr_arm_q, current_lr_arm_dq
-            )
-            time_ik_end = time.time()
-            logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
-            arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                time_ik_end = time.time()
+                logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
+                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+            else:
+                current_lr_arm_q = np.zeros(14)
+                current_lr_arm_dq = np.zeros(14)
+                sol_q = np.zeros(14)
+                sol_tauff = np.zeros(14)
 
             # record data
             if args.record:
@@ -580,7 +644,7 @@ if __name__ == "__main__":
                         right_ee_state = [dual_gripper_state_array[1]]
                         left_hand_action = [dual_gripper_action_array[0]]
                         right_hand_action = [dual_gripper_action_array[1]]
-                        current_body_state = arm_ctrl.get_current_motor_q().tolist()
+                        current_body_state = arm_ctrl.get_current_motor_q().tolist() if arm_ctrl is not None else []
                         current_body_action = [
                             vx,
                             vy,
@@ -719,7 +783,8 @@ if __name__ == "__main__":
         logger_mp.error(traceback.format_exc())
     finally:
         try:
-            arm_ctrl.ctrl_dual_arm_go_home()
+            if enable_arm_control and arm_ctrl is not None:
+                arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
 
@@ -743,10 +808,9 @@ if __name__ == "__main__":
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
 
         try:
-            if not args.motion:
-                pass
-                # status, result = motion_switcher.Exit_Debug_Mode()
-                # logger_mp.info(f"Exit debug mode: {'Success' if status == 3104 else 'Failed'}")
+            if not args.motion and not args.sim:
+                status, result = motion_switcher.Exit_Debug_Mode()
+                logger_mp.info(f"Exit debug mode: {'Success' if status == 3104 else 'Failed'}")
         except Exception as e:
             logger_mp.error(f"Failed to exit debug mode: {e}")
 

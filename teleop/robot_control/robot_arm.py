@@ -18,6 +18,9 @@ kTopicLowCommand_Debug = "rt/lowcmd"
 kTopicLowCommand_Motion = "rt/arm_sdk"
 kTopicLowState = "rt/lowstate"
 
+PosStopF = 2.146e9
+VelStopF = 16000.0
+
 G1_29_Num_Motors = 35
 G1_23_Num_Motors = 35
 H1_2_Num_Motors = 35
@@ -65,12 +68,14 @@ class DataBuffer:
 
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode=False, simulation_mode=False):
+    def __init__(self, motion_mode=False, simulation_mode=False, lock_lower_body_joints=True):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
+        self.lock_lower_body_joints = lock_lower_body_joints
+        self.publish_enabled = True
         self.kp_high = 300.0
         self.kd_high = 3.0
         self.kp_low = 80.0
@@ -114,10 +119,27 @@ class G1_29_ArmController:
         self.all_motor_q = self.get_current_motor_q()
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
-        logger_mp.info("Lock all joints except two arms...")
+        if self.lock_lower_body_joints:
+            logger_mp.info("Lock all joints except two arms...")
+        else:
+            logger_mp.info("loco-manip mode: do not lock lower-body joints.")
 
         arm_indices = set(member.value for member in G1_29_JointArmIndex)
+        waist_indices = {
+            G1_29_JointIndex.kWaistYaw.value,
+            G1_29_JointIndex.kWaistRoll.value,
+            G1_29_JointIndex.kWaistPitch.value,
+        }
         for id in G1_29_JointIndex:
+            if (not self.lock_lower_body_joints) and (id.value not in arm_indices) and (id.value not in waist_indices):
+                # In loco-manip mode, keep non-arm/non-waist joints in stop semantics.
+                self.msg.motor_cmd[id].mode = 1
+                self.msg.motor_cmd[id].kp = 0
+                self.msg.motor_cmd[id].kd = 0
+                self.msg.motor_cmd[id].q = PosStopF
+                self.msg.motor_cmd[id].dq = VelStopF
+                self.msg.motor_cmd[id].tau = 0
+                continue
             self.msg.motor_cmd[id].mode = 1
             if id.value in arm_indices:
                 if self._Is_wrist_motor(id):
@@ -183,8 +205,9 @@ class G1_29_ArmController:
                 self.msg.motor_cmd[id].dq = 0
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            if self.publish_enabled:
+                self.msg.crc = self.crc.Crc(self.msg)
+                self.lowcmd_publisher.Write(self.msg)
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -202,6 +225,10 @@ class G1_29_ArmController:
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
+
+    def set_publish_enabled(self, enabled: bool):
+        with self.ctrl_lock:
+            self.publish_enabled = enabled
 
     def get_mode_machine(self):
         """Return current dds mode machine."""
@@ -348,9 +375,11 @@ class G1_29_JointIndex(IntEnum):
 
 
 class G1_23_ArmController:
-    def __init__(self, motion_mode=False, simulation_mode=False):
+    def __init__(self, motion_mode=False, simulation_mode=False, lock_lower_body_joints=True):
         self.simulation_mode = simulation_mode
         self.motion_mode = motion_mode
+        self.lock_lower_body_joints = lock_lower_body_joints
+        self.publish_enabled = True
 
         logger_mp.info("Initialize G1_23_ArmController...")
         self.q_target = np.zeros(10)
@@ -399,10 +428,27 @@ class G1_23_ArmController:
         self.all_motor_q = self.get_current_motor_q()
         logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.info(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
-        logger_mp.info("Lock all joints except two arms...")
+        if self.lock_lower_body_joints:
+            logger_mp.info("Lock all joints except two arms...")
+        else:
+            logger_mp.info("loco-manip mode: do not lock lower-body joints.")
 
         arm_indices = set(member.value for member in G1_23_JointArmIndex)
+        waist_indices = {
+            G1_23_JointIndex.kWaistYaw.value,
+            G1_23_JointIndex.kWaistRollNotUsed.value,
+            G1_23_JointIndex.kWaistPitchNotUsed.value,
+        }
         for id in G1_23_JointIndex:
+            if (not self.lock_lower_body_joints) and (id.value not in arm_indices) and (id.value not in waist_indices):
+                # In loco-manip mode, keep non-arm/non-waist joints in stop semantics.
+                self.msg.motor_cmd[id].mode = 1
+                self.msg.motor_cmd[id].kp = 0
+                self.msg.motor_cmd[id].kd = 0
+                self.msg.motor_cmd[id].q = PosStopF
+                self.msg.motor_cmd[id].dq = VelStopF
+                self.msg.motor_cmd[id].tau = 0
+                continue
             self.msg.motor_cmd[id].mode = 1
             if id.value in arm_indices:
                 if self._Is_wrist_motor(id):
@@ -468,8 +514,9 @@ class G1_23_ArmController:
                 self.msg.motor_cmd[id].dq = 0
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            if self.publish_enabled:
+                self.msg.crc = self.crc.Crc(self.msg)
+                self.lowcmd_publisher.Write(self.msg)
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -487,6 +534,10 @@ class G1_23_ArmController:
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
+
+    def set_publish_enabled(self, enabled: bool):
+        with self.ctrl_lock:
+            self.publish_enabled = enabled
 
     def get_mode_machine(self):
         """Return current dds mode machine."""
@@ -625,9 +676,11 @@ class G1_23_JointIndex(IntEnum):
 
 
 class H1_2_ArmController:
-    def __init__(self, motion_mode=False, simulation_mode=False):
+    def __init__(self, motion_mode=False, simulation_mode=False, lock_lower_body_joints=True):
         self.simulation_mode = simulation_mode
         self.motion_mode = motion_mode
+        self.lock_lower_body_joints = lock_lower_body_joints
+        self.publish_enabled = True
 
         logger_mp.info("Initialize H1_2_ArmController...")
         self.q_target = np.zeros(14)
@@ -676,10 +729,25 @@ class H1_2_ArmController:
         self.all_motor_q = self.get_current_motor_q()
         logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.info(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
-        logger_mp.info("Lock all joints except two arms...")
+        if self.lock_lower_body_joints:
+            logger_mp.info("Lock all joints except two arms...")
+        else:
+            logger_mp.info("loco-manip mode: do not lock lower-body joints.")
 
         arm_indices = set(member.value for member in H1_2_JointArmIndex)
+        waist_indices = {
+            H1_2_JointIndex.kWaistYaw.value,
+        }
         for id in H1_2_JointIndex:
+            if (not self.lock_lower_body_joints) and (id.value not in arm_indices) and (id.value not in waist_indices):
+                # In loco-manip mode, keep non-arm/non-waist joints in stop semantics.
+                self.msg.motor_cmd[id].mode = 1
+                self.msg.motor_cmd[id].kp = 0
+                self.msg.motor_cmd[id].kd = 0
+                self.msg.motor_cmd[id].q = PosStopF
+                self.msg.motor_cmd[id].dq = VelStopF
+                self.msg.motor_cmd[id].tau = 0
+                continue
             self.msg.motor_cmd[id].mode = 1
             if id.value in arm_indices:
                 if self._Is_wrist_motor(id):
@@ -745,8 +813,9 @@ class H1_2_ArmController:
                 self.msg.motor_cmd[id].dq = 0
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            if self.publish_enabled:
+                self.msg.crc = self.crc.Crc(self.msg)
+                self.lowcmd_publisher.Write(self.msg)
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -764,6 +833,10 @@ class H1_2_ArmController:
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
+
+    def set_publish_enabled(self, enabled: bool):
+        with self.ctrl_lock:
+            self.publish_enabled = enabled
 
     def get_mode_machine(self):
         """Return current dds mode machine."""
