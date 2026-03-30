@@ -1,7 +1,9 @@
 import argparse
+import json
 import threading
 import time
 from multiprocessing import Array, Lock, Value
+from typing import Optional
 
 import logging_mp
 import numpy as np
@@ -100,6 +102,62 @@ def publish_reset_category(category: int, publisher):  # Scene Reset signal
 def publish_run_command(command, publisher):
     msg = String_(data=str(command))
     publisher.Write(msg)
+
+
+class HomieTeleopZmqPublisher:
+    def __init__(
+        self,
+        ipc_path: str,
+        topic: str,
+        publish_hz: float,
+        snd_hwm: int = 1,
+        linger_ms: int = 0,
+    ):
+        try:
+            import zmq
+        except ImportError as exc:
+            raise ImportError("ZMQ dependency not found. Please install pyzmq.") from exc
+
+        abs_path = os.path.abspath(os.path.expanduser(ipc_path))
+        self._endpoint = f"ipc://{abs_path}"
+        self._topic = topic
+        self._topic_bytes = topic.encode("utf-8")
+        self._zmq = zmq
+        self._context = zmq.Context.instance()
+        self._socket = self._context.socket(zmq.PUB)
+        self._socket.setsockopt(zmq.SNDHWM, snd_hwm)
+        self._socket.setsockopt(zmq.LINGER, linger_ms)
+        self._socket.bind(self._endpoint)
+        self._publish_period = 1.0 / max(float(publish_hz), 1e-3)
+        self._last_publish_time = 0.0
+
+    def publish(self, vx: float, vy: float, vyaw: float, stand_height: float, arm_joint_q) -> None:
+        now = time.time()
+        if now - self._last_publish_time < self._publish_period:
+            return
+
+        payload = {
+            "ts": now,
+            "joystick_cmd": {
+                "vx": float(vx),
+                "vy": float(vy),
+                "vyaw": float(vyaw),
+                "stand_height": float(stand_height),
+            },
+            "arm_joint_q": np.asarray(arm_joint_q, dtype=np.float32).tolist(),
+        }
+
+        data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        try:
+            self._socket.send_multipart([self._topic_bytes, data], flags=self._zmq.NOBLOCK)
+            self._last_publish_time = now
+        except self._zmq.Again:
+            return
+
+    def close(self) -> None:
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
 
 
 # state transition
@@ -208,6 +266,35 @@ if __name__ == "__main__":
         action="store_true",
         help="Process XR/VR data normally but skip sending any robot actuation commands.",
     )
+    parser.add_argument(
+        "--enable-zmq-publish",
+        action="store_true",
+        help="Enable ZMQ publishing for joystick velocity command and IK arm joints.",
+    )
+    parser.add_argument(
+        "--zmq-ipc-path",
+        type=str,
+        default="/tmp/homie_teleop.sock",
+        help="ZMQ IPC path for teleop publish, e.g. /tmp/homie_teleop.sock",
+    )
+    parser.add_argument(
+        "--zmq-topic",
+        type=str,
+        default="homie.teleop.command",
+        help="ZMQ topic for teleop publish.",
+    )
+    parser.add_argument(
+        "--zmq-publish-hz",
+        type=float,
+        default=60.0,
+        help="Max ZMQ publish frequency.",
+    )
+    parser.add_argument(
+        "--zmq-stand-height",
+        type=float,
+        default=0.74,
+        help="Stand height included in published joystick command.",
+    )
     # mode flags
     parser.add_argument("--motion", action="store_true", help="Enable motion control mode")
     parser.add_argument("--headless", action="store_true", help="Enable headless mode (no display)")
@@ -234,6 +321,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logger_mp.info(f"args: {args}")
     dry_run = args.dry_run
+    homie_zmq_publisher: Optional[HomieTeleopZmqPublisher] = None
 
     try:
         # setup dds communication domains id
@@ -243,6 +331,16 @@ if __name__ == "__main__":
             ChannelFactoryInitialize(0, networkInterface=args.network_interface)
 
         # ipc communication mode. client usage: see utils/ipc.py
+        if args.enable_zmq_publish:
+            homie_zmq_publisher = HomieTeleopZmqPublisher(
+                ipc_path=args.zmq_ipc_path,
+                topic=args.zmq_topic,
+                publish_hz=args.zmq_publish_hz,
+            )
+            logger_mp.info(
+                f"ZMQ publish enabled: bind=ipc://{os.path.abspath(os.path.expanduser(args.zmq_ipc_path))}, topic={args.zmq_topic}, hz={args.zmq_publish_hz}"
+            )
+
         if args.ipc:
             ipc_server = IPC_Server(on_press=on_press, get_state=get_state)
             ipc_server.start()
@@ -674,6 +772,15 @@ if __name__ == "__main__":
                 sol_q = np.zeros(14)
                 sol_tauff = np.zeros(14)
 
+            if homie_zmq_publisher is not None:
+                homie_zmq_publisher.publish(
+                    vx=vx,
+                    vy=vy,
+                    vyaw=vyaw,
+                    stand_height=args.zmq_stand_height,
+                    arm_joint_q=sol_q,
+                )
+
             # record data
             if args.record:
                 READY = recorder.is_ready()  # now ready to (2) enter RECORD_RUNNING state
@@ -862,6 +969,12 @@ if __name__ == "__main__":
             tv_wrapper.close()
         except Exception as e:
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
+
+        try:
+            if homie_zmq_publisher is not None:
+                homie_zmq_publisher.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close teleop zmq publisher: {e}")
 
         try:
             if (not dry_run) and (not args.motion) and (not args.sim) and (motion_switcher is not None):
