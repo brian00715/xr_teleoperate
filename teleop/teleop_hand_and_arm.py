@@ -203,6 +203,11 @@ if __name__ == "__main__":
         default="loco-manip",
         help="Control arbitration mode: loco only, manip only, or loco + manip.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Process XR/VR data normally but skip sending any robot actuation commands.",
+    )
     # mode flags
     parser.add_argument("--motion", action="store_true", help="Enable motion control mode")
     parser.add_argument("--headless", action="store_true", help="Enable headless mode (no display)")
@@ -228,6 +233,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     logger_mp.info(f"args: {args}")
+    dry_run = args.dry_run
 
     try:
         # setup dds communication domains id
@@ -289,62 +295,83 @@ if __name__ == "__main__":
             f"Control mode={control_mode}, enable_loco={enable_loco_control}, "
             f"enable_arm={enable_arm_control}, lock_lower_body_for_arm={lock_lower_body_for_arm}"
         )
+        if dry_run:
+            logger_mp.info("[DRY-RUN] Enabled: XR/VR data is processed, but no control commands will be sent.")
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
             if args.sim:
                 logger_mp.info("Simulation mode: skip MotionSwitcher; keep arm lowcmd on rt/lowcmd.")
             else:
-                # Ensure robot is switched out of debug mode before sending motion/loco RPC commands.
-                motion_switcher = MotionSwitcher()
-                status, result = motion_switcher.Exit_Debug_Mode()
-                logger_mp.info(f"Exit debug mode for motion: {'Success' if status == 0 else 'Failed'}")
+                if dry_run:
+                    logger_mp.info("[DRY-RUN] Skip Exit_Debug_Mode RPC before motion.")
+                else:
+                    # Ensure robot is switched out of debug mode before sending motion/loco RPC commands.
+                    motion_switcher = MotionSwitcher()
+                    status, result = motion_switcher.Exit_Debug_Mode()
+                    logger_mp.info(f"Exit debug mode for motion: {'Success' if status == 0 else 'Failed'}")
             if controller_input:
                 if args.sim:
-                    run_command_publisher = ChannelPublisher("rt/run_command/cmd", String_)
-                    run_command_publisher.Init()
-                    logger_mp.info("Simulation run_command publisher initialized: rt/run_command/cmd")
+                    if dry_run:
+                        logger_mp.info("[DRY-RUN] Skip simulation run_command publisher initialization.")
+                    else:
+                        run_command_publisher = ChannelPublisher("rt/run_command/cmd", String_)
+                        run_command_publisher.Init()
+                        logger_mp.info("Simulation run_command publisher initialized: rt/run_command/cmd")
                 else:
-                    loco_wrapper = LocoClientWrapper()
-                    logger_mp.info("LocoClientWrapper initialized for controller safety actions (damp/stop).")
-                    if enable_loco_control:
-                        move_mode_code = loco_wrapper.Exit_Damp_Mode()
-                        logger_mp.info(f"Enter move mode at startup code={move_mode_code}")
+                    if dry_run:
+                        logger_mp.info("[DRY-RUN] Skip LocoClientWrapper initialization and startup RPC actions.")
+                    else:
+                        loco_wrapper = LocoClientWrapper()
+                        logger_mp.info("LocoClientWrapper initialized for controller safety actions (damp/stop).")
+                        if enable_loco_control:
+                            move_mode_code = loco_wrapper.Exit_Damp_Mode()
+                            logger_mp.info(f"Enter move mode at startup code={move_mode_code}")
         else:
             if args.sim:
                 logger_mp.info("Simulation mode: skip MotionSwitcher.")
             else:
-                motion_switcher = MotionSwitcher()
-                status, result = motion_switcher.Enter_Debug_Mode()
-                logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
+                if dry_run:
+                    logger_mp.info("[DRY-RUN] Skip Enter_Debug_Mode RPC.")
+                else:
+                    motion_switcher = MotionSwitcher()
+                    status, result = motion_switcher.Enter_Debug_Mode()
+                    logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
 
         # arm
         if enable_arm_control:
             if args.arm == "G1_29":
                 arm_ik = G1_29_ArmIK()
-                arm_ctrl = G1_29_ArmController(
-                    motion_mode=arm_motion_mode,
-                    simulation_mode=args.sim,
-                    lock_lower_body_joints=lock_lower_body_for_arm,
-                )
+                if not dry_run:
+                    arm_ctrl = G1_29_ArmController(
+                        motion_mode=arm_motion_mode,
+                        simulation_mode=args.sim,
+                        lock_lower_body_joints=lock_lower_body_for_arm,
+                    )
             elif args.arm == "G1_23":
                 arm_ik = G1_23_ArmIK()
-                arm_ctrl = G1_23_ArmController(
-                    motion_mode=arm_motion_mode,
-                    simulation_mode=args.sim,
-                    lock_lower_body_joints=lock_lower_body_for_arm,
-                )
+                if not dry_run:
+                    arm_ctrl = G1_23_ArmController(
+                        motion_mode=arm_motion_mode,
+                        simulation_mode=args.sim,
+                        lock_lower_body_joints=lock_lower_body_for_arm,
+                    )
             elif args.arm == "H1_2":
                 arm_ik = H1_2_ArmIK()
-                arm_ctrl = H1_2_ArmController(
-                    motion_mode=arm_motion_mode,
-                    simulation_mode=args.sim,
-                    lock_lower_body_joints=lock_lower_body_for_arm,
-                )
+                if not dry_run:
+                    arm_ctrl = H1_2_ArmController(
+                        motion_mode=arm_motion_mode,
+                        simulation_mode=args.sim,
+                        lock_lower_body_joints=lock_lower_body_for_arm,
+                    )
             elif args.arm == "H1":
                 arm_ik = H1_ArmIK()
-                arm_ctrl = H1_ArmController(simulation_mode=args.sim)
+                if not dry_run:
+                    arm_ctrl = H1_ArmController(simulation_mode=args.sim)
         else:
             logger_mp.info("Arm controller and IK are disabled by control mode.")
+
+        if dry_run and enable_arm_control:
+            logger_mp.info("[DRY-RUN] Arm IK is active, but arm controller command publishing is disabled.")
 
         # end-effector
         if args.ee == "dex3":
@@ -355,14 +382,15 @@ if __name__ == "__main__":
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array("d", 14, lock=False)  # [output] current left, right hand state(14) data.
             dual_hand_action_array = Array("d", 14, lock=False)  # [output] current left, right hand action(14) data.
-            hand_ctrl = Dex3_1_Controller(
-                left_hand_pos_array,
-                right_hand_pos_array,
-                dual_hand_data_lock,
-                dual_hand_state_array,
-                dual_hand_action_array,
-                simulation_mode=args.sim,
-            )
+            if not dry_run:
+                hand_ctrl = Dex3_1_Controller(
+                    left_hand_pos_array,
+                    right_hand_pos_array,
+                    dual_hand_data_lock,
+                    dual_hand_state_array,
+                    dual_hand_action_array,
+                    simulation_mode=args.sim,
+                )
         elif args.ee == "dex1":
             from teleop.robot_control.robot_hand_unitree import Dex1_1_Gripper_Controller
 
@@ -371,14 +399,15 @@ if __name__ == "__main__":
             dual_gripper_data_lock = Lock()
             dual_gripper_state_array = Array("d", 2, lock=False)  # current left, right gripper state(2) data.
             dual_gripper_action_array = Array("d", 2, lock=False)  # current left, right gripper action(2) data.
-            gripper_ctrl = Dex1_1_Gripper_Controller(
-                left_gripper_value,
-                right_gripper_value,
-                dual_gripper_data_lock,
-                dual_gripper_state_array,
-                dual_gripper_action_array,
-                simulation_mode=args.sim,
-            )
+            if not dry_run:
+                gripper_ctrl = Dex1_1_Gripper_Controller(
+                    left_gripper_value,
+                    right_gripper_value,
+                    dual_gripper_data_lock,
+                    dual_gripper_state_array,
+                    dual_gripper_action_array,
+                    simulation_mode=args.sim,
+                )
         elif args.ee == "inspire_dfx":
             from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX
 
@@ -387,14 +416,15 @@ if __name__ == "__main__":
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array("d", 12, lock=False)  # [output] current left, right hand state(12) data.
             dual_hand_action_array = Array("d", 12, lock=False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Inspire_Controller_DFX(
-                left_hand_pos_array,
-                right_hand_pos_array,
-                dual_hand_data_lock,
-                dual_hand_state_array,
-                dual_hand_action_array,
-                simulation_mode=args.sim,
-            )
+            if not dry_run:
+                hand_ctrl = Inspire_Controller_DFX(
+                    left_hand_pos_array,
+                    right_hand_pos_array,
+                    dual_hand_data_lock,
+                    dual_hand_state_array,
+                    dual_hand_action_array,
+                    simulation_mode=args.sim,
+                )
         elif args.ee == "inspire_ftp":
             from teleop.robot_control.robot_hand_inspire import Inspire_Controller_FTP
 
@@ -403,14 +433,15 @@ if __name__ == "__main__":
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array("d", 12, lock=False)  # [output] current left, right hand state(12) data.
             dual_hand_action_array = Array("d", 12, lock=False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Inspire_Controller_FTP(
-                left_hand_pos_array,
-                right_hand_pos_array,
-                dual_hand_data_lock,
-                dual_hand_state_array,
-                dual_hand_action_array,
-                simulation_mode=args.sim,
-            )
+            if not dry_run:
+                hand_ctrl = Inspire_Controller_FTP(
+                    left_hand_pos_array,
+                    right_hand_pos_array,
+                    dual_hand_data_lock,
+                    dual_hand_state_array,
+                    dual_hand_action_array,
+                    simulation_mode=args.sim,
+                )
         elif args.ee == "brainco":
             from teleop.robot_control.robot_hand_brainco import Brainco_Controller
 
@@ -419,16 +450,20 @@ if __name__ == "__main__":
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array("d", 12, lock=False)  # [output] current left, right hand state(12) data.
             dual_hand_action_array = Array("d", 12, lock=False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Brainco_Controller(
-                left_hand_pos_array,
-                right_hand_pos_array,
-                dual_hand_data_lock,
-                dual_hand_state_array,
-                dual_hand_action_array,
-                simulation_mode=args.sim,
-            )
+            if not dry_run:
+                hand_ctrl = Brainco_Controller(
+                    left_hand_pos_array,
+                    right_hand_pos_array,
+                    dual_hand_data_lock,
+                    dual_hand_state_array,
+                    dual_hand_action_array,
+                    simulation_mode=args.sim,
+                )
         else:
             pass
+
+        if dry_run and args.ee is not None:
+            logger_mp.info("[DRY-RUN] End-effector command publishing is disabled.")
 
         # affinity mode (if you dont know what it is, then you probably don't need it)
         if args.affinity:
@@ -452,8 +487,12 @@ if __name__ == "__main__":
 
         # simulation mode
         if args.sim:
-            reset_pose_publisher = ChannelPublisher("rt/reset_pose/cmd", String_)
-            reset_pose_publisher.Init()
+            reset_pose_publisher = None
+            if not dry_run:
+                reset_pose_publisher = ChannelPublisher("rt/reset_pose/cmd", String_)
+                reset_pose_publisher.Init()
+            else:
+                logger_mp.info("[DRY-RUN] Skip simulation reset_pose publisher initialization.")
             from teleop.utils.sim_state_topic import start_sim_state_subscribe
 
             sim_state_subscriber = start_sim_state_subscribe()
@@ -480,6 +519,8 @@ if __name__ == "__main__":
         logger_mp.info(
             f"EE pose scale: translation={args.ee_translation_scale}, rotation(axis-angle)={args.ee_rotation_scale}"
         )
+        if dry_run:
+            logger_mp.info("[DRY-RUN] Active: computed targets are not sent to robot/simulation outputs.")
         READY = True  # now ready to (1) enter START state
         while not START and not STOP:  # wait for start or stop signal.
             time.sleep(0.033)
@@ -522,7 +563,7 @@ if __name__ == "__main__":
                 else:
                     RECORD_RUNNING = False
                     recorder.save_episode()
-                    if args.sim:
+                    if args.sim and (not dry_run) and (reset_pose_publisher is not None):
                         publish_reset_category(1, reset_pose_publisher)
 
             # get xr's tele data
@@ -557,7 +598,10 @@ if __name__ == "__main__":
 
             damp_pressed_now = controller_input and tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick
             if damp_pressed_now and (not damp_pressed_last):
-                if args.sim and run_command_publisher is not None:
+                if dry_run:
+                    logger_mp.info("[DRY-RUN] Dampen command requested; skipped command publish/RPC.")
+                    in_damp_mode = True
+                elif args.sim and run_command_publisher is not None:
                     publish_run_command([0.0, 0.0, 0.0, sim_stand_height], run_command_publisher)
                     logger_mp.info("Enter damp mode command published in simulation.")
                     in_damp_mode = True
@@ -570,7 +614,14 @@ if __name__ == "__main__":
             # high level control
             if enable_loco_control:
                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
-                if args.sim:
+                if dry_run:
+                    now = time.time()
+                    if now >= next_loco_log_time:
+                        logger_mp.info(
+                            f"[DRY-RUN] loco target vx={vx:.3f}, vy={vy:.3f}, vyaw={vyaw:.3f}, in_damp={in_damp_mode}"
+                        )
+                        next_loco_log_time = now + 1.0
+                elif args.sim:
                     publish_run_command([vx, vy, vyaw, sim_stand_height], run_command_publisher)
                 else:
                     if in_damp_mode and (abs(vx) > 1e-3 or abs(vy) > 1e-3 or abs(vyaw) > 1e-3):
@@ -588,9 +639,13 @@ if __name__ == "__main__":
                         next_loco_log_time = now + 1.0
 
             # get current robot state data and solve ik (disabled during locomotion-only test)
-            if enable_arm_control and arm_ctrl is not None and arm_ik is not None:
-                current_lr_arm_q = arm_ctrl.get_current_dual_arm_q()
-                current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
+            if enable_arm_control and arm_ik is not None:
+                if arm_ctrl is not None:
+                    current_lr_arm_q = arm_ctrl.get_current_dual_arm_q()
+                    current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
+                else:
+                    current_lr_arm_q = np.zeros(14)
+                    current_lr_arm_dq = np.zeros(14)
 
                 left_wrist_pose = tele_data.left_wrist_pose
                 right_wrist_pose = tele_data.right_wrist_pose
@@ -611,7 +666,8 @@ if __name__ == "__main__":
                 )
                 time_ik_end = time.time()
                 logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
-                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                if (not dry_run) and (arm_ctrl is not None):
+                    arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
             else:
                 current_lr_arm_q = np.zeros(14)
                 current_lr_arm_dq = np.zeros(14)
@@ -783,7 +839,7 @@ if __name__ == "__main__":
         logger_mp.error(traceback.format_exc())
     finally:
         try:
-            if enable_arm_control and arm_ctrl is not None:
+            if (not dry_run) and enable_arm_control and arm_ctrl is not None:
                 arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
@@ -808,7 +864,7 @@ if __name__ == "__main__":
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
 
         try:
-            if not args.motion and not args.sim:
+            if (not dry_run) and (not args.motion) and (not args.sim) and (motion_switcher is not None):
                 status, result = motion_switcher.Exit_Debug_Mode()
                 logger_mp.info(f"Exit debug mode: {'Success' if status == 3104 else 'Failed'}")
         except Exception as e:
